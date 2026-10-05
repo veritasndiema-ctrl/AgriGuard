@@ -1,0 +1,11 @@
+--- AgriGuard-main/tests/test_api.py	2026-09-28 09:09:45.000000000 +0000
++++ tests/test_api.py	2026-10-05 10:15:37.098304352 +0000
+@@ -154,7 +154,7 @@
+     r = client.get("/markets/summary/Maize")
+     assert r.status_code == 200
+     body = r.json()
+-    assert body["commodity"] == "Maize"
++    assert body["commodity"].startswith("Maize")  # resolves to the current "Maize (White)" series
+     assert "best_market_to_sell" in body
+     assert "national_avg_price" in body
+ 

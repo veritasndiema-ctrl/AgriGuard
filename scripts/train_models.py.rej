@@ -1,0 +1,55 @@
+--- AgriGuard-main/scripts/train_models.py	2026-09-28 09:09:45.000000000 +0000
++++ scripts/train_models.py	2026-10-05 10:17:19.396130306 +0000
+@@ -203,9 +203,14 @@
+ def train_price_model(X, y):
+     print("\n🤖 Training XGBoost price forecast model…")
+ 
+-    X_train, X_test, y_train, y_test = train_test_split(
+-        X, y, test_size=0.2, shuffle=False  # time-ordered split
+-    )
++    # TRUE chronological split. X is sorted by (commodity, market, date), so a
++    # positional shuffle=False split would hold out whole crops, not the most
++    # recent months. Split on the calendar instead: the latest 20% of months.
++    month_key = X["year"] * 12 + X["month"]
++    cutoff = month_key.quantile(0.8)
++    train_mask = month_key <= cutoff
++    X_train, X_test = X[train_mask], X[~train_mask]
++    y_train, y_test = y[train_mask], y[~train_mask]
+ 
+     model = XGBRegressor(
+         n_estimators=400,
+@@ -229,6 +234,12 @@
+     r2   = r2_score(y_test, preds)
+     mape = np.mean(np.abs((y_test - preds) / y_test.clip(lower=1))) * 100
+ 
++    # Naive baseline: "next price = last observed price" (price_lag1).
++    naive = X_test["price_lag1"]
++    naive_mae = mean_absolute_error(y_test, naive)
++    naive_mape = np.mean(np.abs((y_test - naive) / y_test.clip(lower=1))) * 100
++    print(f"   Naive (last price) MAE: {naive_mae:,.2f} UGX | MAPE: {naive_mape:.2f}%")
++
+     print(f"   MAE  : {mae:,.2f} UGX")
+     print(f"   RMSE : {rmse:,.2f} UGX")
+     print(f"   MAPE : {mape:.2f}%")
+@@ -242,6 +253,9 @@
+         "RMSE_UGX":   round(rmse, 2),
+         "MAPE_pct":   round(mape, 2),
+         "R2":         round(r2, 4),
++        "split":      "chronological (latest 20% of months held out)",
++        "naive_MAE_UGX":  round(naive_mae, 2),
++        "naive_MAPE_pct": round(naive_mape, 2),
+     }
+     return model, metrics
+ 
+@@ -271,6 +285,11 @@
+     }
+     with open(meta_path, "w") as f:
+         json.dump(all_metrics, f, indent=2)
++    # ml/models/ is gitignored; keep a committed, reviewable copy of the numbers
++    # quoted in the README / pitch next to the code that produced them.
++    committed = outdir.parent / "metrics.json"
++    with open(committed, "w") as f:
++        json.dump(all_metrics, f, indent=2)
+ 
+     print(f"\n✅ Saved:")
+     print(f"   {price_path}  ({price_path.stat().st_size / 1024:.0f} KB)")

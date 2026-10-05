@@ -1,0 +1,48 @@
+{
+  "name": "agriguard-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "lint:fix": "eslint . --ext ts,tsx --fix",
+    "format": "prettier --write \"src/**/*.{ts,tsx,css,scss,json,md}\"",
+    "type-check": "tsc --noEmit",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2",
+    "@tanstack/react-query": "^5.59.0",
+    "axios": "^1.7.7",
+    "recharts": "^2.12.7",
+    "chart.js": "^4.4.1",
+    "react-chartjs-2": "^5.3.0",
+    "lucide-react": "^0.441.0",
+    "tailwindcss": "^3.4.13",
+    "clsx": "^2.1.1",
+    "class-variance-authority": "^0.7.0",
+    "date-fns": "^3.6.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "vite": "^5.4.8",
+    "typescript": "^5.6.2",
+    "eslint": "^9.11.1",
+    "eslint-plugin-react-hooks": "^5.1.0-rc.0",
+    "eslint-plugin-react-refresh": "^0.4.12",
+    "@typescript-eslint/eslint-plugin": "^8.8.0",
+    "@typescript-eslint/parser": "^8.8.0",
+    "prettier": "^3.3.3",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.47",
+    "vitest": "^2.1.1"
+  }
+}

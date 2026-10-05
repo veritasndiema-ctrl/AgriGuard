@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+bad=$(git diff --cached --name-only --diff-filter=AM | grep -E '\.(patch|db|sqlite3?)$|(^|/)\.env$|\.weather_sync_state\.json$' || true)
+if [ -n "$bad" ]; then
+  echo "BLOCKED: these files must not be committed:"; echo "$bad"
+  echo "Unstage with: git restore --staged <file>"; exit 1
+fi
+if [ "${SKIP_TESTS:-0}" != "1" ]; then
+  python3 -m pytest -q -x --no-header -p no:cacheprovider tests quant/tests || { echo "BLOCKED: tests failing (SKIP_TESTS=1 to bypass once)"; exit 1; }
+fi

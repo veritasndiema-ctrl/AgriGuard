@@ -1,0 +1,53 @@
+# API
+fastapi==0.136.1
+uvicorn==0.46.0
+python-multipart==0.0.28
+python-dotenv==1.2.2
+pydantic==2.13.4
+pydantic-settings==2.14.1
+
+# Database
+sqlalchemy==2.0.49
+alembic==1.18.4
+aiomysql==0.3.2
+PyMySQL==1.1.3
+
+# ML & Data
+pandas==2.3.3
+numpy==2.4.4
+scikit-learn==1.5.0
+prophet==1.3.0
+xgboost==3.2.0
+lightgbm==4.6.0
+joblib==1.5.3
+scipy==1.17.1
+
+# Quant (backtesting, prediction intervals, risk/volatility metrics)
+# Shared discipline with the Vestora quant module
+statsmodels==0.14.6
+arch==7.2.0
+mapie==0.9.2
+pyarrow>=22.0.0            # parquet I/O — required by notebooks/ intermediate pipeline outputs
+
+# Dashboard
+streamlit==1.57.0
+streamlit-autorefresh==1.0.1
+plotly==6.7.0
+matplotlib==3.10.9
+seaborn==0.13.2
+
+# Auth & Security
+python-jose==3.5.0
+bcrypt==5.0.0
+passlib==1.7.4
+
+# HTTP
+httpx==0.28.1
+requests==2.34.0
+
+# Fail-safe / Resilience
+# Retry + circuit-breaking for flaky connectivity, local caching for offline
+# fallback, and background scheduling for sync/reconciliation jobs
+tenacity==9.1.2
+diskcache==5.6.3
+apscheduler==3.11.0

@@ -1,0 +1,1 @@
+"""AgriGuard top-level ml/ workspace — training runs, evaluation, and saved model artifacts (see ml/README.md)."""

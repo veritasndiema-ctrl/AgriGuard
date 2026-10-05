@@ -1,0 +1,27 @@
+{
+  "name": "@agriguard/api-client",
+  "version": "0.1.0",
+  "description": "Shared TypeScript client for the AgriGuard FastAPI backend",
+  "main": "dist/src/client.js",
+  "types": "dist/src/client.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "axios": "^1.7.7"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/node": "^20.14.0"
+  },
+  "peerDependencies": {
+    "typescript": ">=4.9"
+  },
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Agri-Guard/AgriGuard.git",
+    "directory": "shared/api-client"
+  }
+}

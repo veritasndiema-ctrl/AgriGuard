@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Allows plain HTTP (cleartext) to the AgriGuard dev backend.
+  Android 9+ (API 28+) blocks cleartext traffic by default.
+  Add your specific LAN IP below instead of allowing it globally —
+  keeps things safe for anything that isn't your own dev server.
+
+  NOTE: 192.168.18.8 matches the LAN IP the desktop dashboard was actually
+  running on (seen in the AgriGuard dashboard screenshots) — the previous
+  192.168.1.42 here didn't match and would have silently blocked the
+  hidden dev-override path (Settings → About, tap version 7x) on a real
+  device. DHCP can still reassign this on your router at any time — if the
+  dev override stops connecting, check `ip addr` / `ifconfig` on the
+  machine running the backend and update this to match.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- Android Emulator loopback alias -->
+        <domain includeSubdomains="false">10.0.2.2</domain>
+        <!-- Keith's dev machine LAN IP — see note above -->
+        <domain includeSubdomains="false">192.168.18.8</domain>
+    </domain-config>
+</network-security-config>

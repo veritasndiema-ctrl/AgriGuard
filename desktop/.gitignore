@@ -1,0 +1,18 @@
+# ── Node ──────────────────────────────────────────────────────────────────────
+node_modules/
+dist/
+.vite/
+
+# ── Rust / Tauri ──────────────────────────────────────────────────────────────
+src-tauri/target/
+src-tauri/gen/
+
+# ── Generated app icons (regenerate with `tauri icon`) ─────────────────────────
+src-tauri/icons/*.png
+src-tauri/icons/*.ico
+src-tauri/icons/*.icns
+!src-tauri/icons/.gitkeep
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+npm-debug.log*
+*.log

@@ -1,0 +1,1368 @@
+"""
+app/routers/forecasts.py — AgriGuard Price Forecasting Router
+=============================================================
+FastAPI router exposing agricultural price forecasting endpoints.
+
+Forecast pipeline:
+  1. Load and clean WFP Uganda price CSV, blended with the fresher-cadence
+     FEWS NET (FDW) feed where the two overlap  (load_price_data)
+  2. Filter to the requested commodity × market combination
+   3. Run the shared rolling-origin validated ensemble from ml/pipeline.py
+      (robust level, damped trend, and monthly seasonal candidates)
+   4. Calibrate intervals from walk-forward residuals via quant_bridge
+  5. Return structured ForecastResponse with trend label and alert
+
+Endpoints:
+  GET /forecasts/commodities             → list available commodities & markets
+  GET /forecasts/{commodity}             → single-market forecast
+  GET /forecasts/compare/{commodity}     → multi-market comparison
+
+Design notes:
+  - Prophet is an optional last-resort dependency; the shared pipeline does
+    not require it and is the production default.
+  - All price values are rounded to 2 decimal places before returning.
+  - Confidence is derived from the relative width of the prediction interval
+    and clamped to [0.0, 1.0] so clients never receive nonsense values.
+  - The alert threshold (5 %) is intentionally conservative for MVP.
+
+Changes from v1:
+  - Extracted _filter_subset() helper — removes duplication between
+    get_forecast() and compare_markets()
+  - Added _clamp_confidence() — v1 could return negative confidence values
+  - Added XGBoost residual correction layer (xgb_residual_correction)
+  - Added /forecasts/history/{commodity} endpoint for sparkline data
+  - Added market fallback chain in get_forecast (market → region → national)
+  - Replaced bare except with explicit exception types throughout
+  - DataPath is now resolved via settings.data_path (not __file__ hacks)
+  - get_trend_label() now uses a longer window and a smoother threshold
+  - compare_markets() returns partial results + a "skipped" list in metadata
+  - Added structured logging with commodity / market / horizon context
+
+Author: AgriGuard Team
+"""
+
+import logging
+import os
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, field_validator
+
+from backend.app.services import wfp_sync, fews_net_sync, weather_sync, quant_bridge, data_sources
+
+from backend.app.services.market_resolver import (
+    best_market, regular_markets, resolve_commodity,
+)
+
+from backend.app.services.market_resolver import (
+    best_market, regular_markets, resolve_commodity,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/forecasts", tags=["Forecasts"])
+
+# ── Data path ─────────────────────────────────────────────────────────────────
+# Prefer the environment variable so Docker / production can override without
+# touching source code. Fall back to the conventional project-relative path.
+
+DATA_PATH: str = os.environ.get(
+    "AGRIGUARD_PRICE_DATA",
+    os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "data", "raw", "wfp_food_prices_uga.csv"
+    ),
+)
+
+# Minimum number of historical observations we're comfortable running the
+# full Prophet/XGBoost pipeline on. Below this we no longer refuse outright
+# (see ABSOLUTE_MIN_OBSERVATIONS) — we drop to naive_forecast() instead and
+# say so in the response, rather than making the farmer hit a dead end.
+MIN_OBSERVATIONS: int = 10
+
+# Hard floor. Below this there simply isn't enough signal to say anything
+# defensible about direction, so we still refuse — but the floor is much
+# lower than MIN_OBSERVATIONS, and the message explains why in plain terms.
+ABSOLUTE_MIN_OBSERVATIONS: int = 3
+
+# Percentage change threshold above which we emit a price alert.
+ALERT_THRESHOLD_PCT: float = 5.0
+
+# =============================================================================
+# Food-only scope
+# =============================================================================
+# AgriGuard forecasts crop/food prices for farmers — not batteries, charcoal,
+# or exercise books. Moved to services/food_scope.py so routers/markets.py
+# can use the exact same filter instead of a second, independently-drifting
+# copy (see that module's docstring for the full history). Re-exported under
+# their original names here so this router's own code — and
+# tests/test_forecasts_food_scope.py, which asserts against `f._is_food_commodity`
+# directly — don't need to change.
+from backend.app.services.food_scope import (  # noqa: E402
+    FOOD_CATEGORIES,
+    NON_FOOD_COMMODITY_KEYWORDS,
+    is_food_commodity as _is_food_commodity,
+)
+
+
+def _friendly_error(status_code: int, technical: str, friendly: str) -> HTTPException:
+    """
+    Log the technical detail server-side (for us) and raise an HTTPException
+    carrying only the friendly message (for the farmer/trader on the other
+    end). Nothing under this router should hand a raw stack trace, column
+    name, or file path back to a USSD/mobile client again.
+    """
+    logger.error(technical)
+    return HTTPException(status_code=status_code, detail=friendly)
+
+
+# =============================================================================
+# Pydantic schemas
+# =============================================================================
+
+class ForecastPoint(BaseModel):
+    """A single predicted price point on the forecast horizon."""
+    date: str                  # ISO-8601 date string "YYYY-MM-DD"
+    predicted_price: float
+    lower_bound: float         # Lower edge of 90 % prediction interval
+    upper_bound: float         # Upper edge of 90 % prediction interval
+    confidence: float          # Clamped to [0.0, 1.0]
+
+
+class ForecastResponse(BaseModel):
+    """Full forecast for one commodity × market combination."""
+    commodity: str
+    market: str
+    currency: str
+    unit: str
+    horizon_days: int
+    observations_used: int     # How many historical points trained the model
+    forecast: list[ForecastPoint]
+    trend: str                 # "rising" | "falling" | "stable"
+    pct_change: float          # Predicted % change over the horizon
+    alert: Optional[str]       # Human-readable warning if pct_change is large
+    model_used: str            # "prophet" | "prophet+xgb" | "linear" | "naive"
+    generated_at: str          # UTC ISO-8601 timestamp
+    data_quality: str = "sufficient"   # "sufficient" | "limited" — see naive_forecast()
+    data_quality_note: Optional[str] = None  # Plain-language caveat when data_quality != "sufficient"
+    latest_observation_date: str
+    data_as_of: str
+    price_source: str
+    source_lag_days: int
+    freshness_status: str  # "live" | "recent" | "stale"
+
+
+class CommodityListResponse(BaseModel):
+    """Available commodities and markets in the loaded dataset."""
+    commodities: list[str]
+    markets: list[str]
+    total_observations: int
+
+
+class HistoryPoint(BaseModel):
+    """A single historical price observation (for sparklines / charts)."""
+    date: str
+    price: float
+
+
+class HistoryResponse(BaseModel):
+    """Historical prices for one commodity × market (last N days)."""
+    commodity: str
+    market: str
+    currency: str
+    unit: str
+    history: list[HistoryPoint]
+
+
+class CompareResponse(BaseModel):
+    """Result of a multi-market comparison."""
+    commodity: str
+    horizon_days: int
+    results: list[ForecastResponse]
+    skipped_markets: list[str]   # Markets requested but with insufficient data
+
+
+class SyncStatusResponse(BaseModel):
+    """Status of the background WFP price-data sync (see services/wfp_sync.py)."""
+    last_modified: Optional[str] = None   # Upstream HDX resource's last-modified timestamp
+    size: Optional[int] = None            # Bytes, as reported by HDX at last sync
+    synced_at: Optional[str] = None       # When we last pulled a fresh copy (UTC ISO-8601)
+
+
+class SyncTriggerResponse(BaseModel):
+    """Result of an on-demand sync check."""
+    updated: bool
+    detail: str
+    status: SyncStatusResponse
+
+
+class FewsNetSyncStatusResponse(BaseModel):
+    """Status of the background FEWS NET price-data sync (see services/fews_net_sync.py)."""
+    row_count: Optional[int] = None       # Observations in the last synced FEWS NET extract
+    max_date: Optional[str] = None        # Most recent date covered by that extract
+    synced_at: Optional[str] = None       # When we last pulled a fresh copy (UTC ISO-8601)
+
+
+class DataFreshnessResponse(BaseModel):
+    """Coverage and sync state for the feeds currently used by AgriGuard."""
+    price_latest_date: Optional[str] = None
+    price_source: Optional[str] = None
+    price_observations: int = 0
+    price_lag_days: Optional[int] = None
+    price_freshness: str = "unknown"
+    wfp_synced_at: Optional[str] = None
+    fews_net_synced_at: Optional[str] = None
+    fews_net_latest_date: Optional[str] = None
+    weather_synced_at: Optional[str] = None
+    weather_forecast_through: Optional[str] = None
+    checked_at: str
+
+
+class DataSourceInfo(BaseModel):
+    """One entry from services/data_sources.py's registry."""
+    name: str
+    url: str
+    status: str            # "active" | "catalogued"
+    scope: str
+    cadence_note: str
+    credibility_note: str
+    note: Optional[str] = None   # catalogued_note, only set for status="catalogued"
+
+
+class SourcesResponse(BaseModel):
+    """Every price-data source AgriGuard auto-syncs from, plus credible
+    sources that have been evaluated and logged but aren't wired up yet."""
+    active: list[DataSourceInfo]
+    catalogued: list[DataSourceInfo]
+
+
+# =============================================================================
+# Data loading and cleaning
+# =============================================================================
+
+def _load_wfp_csv() -> pd.DataFrame:
+    """
+    Load the WFP Uganda price CSV and return a cleaned, standardised DataFrame.
+
+    WFP publishes its CSVs with several column name variants across years.
+    This function normalises them all to a consistent schema:
+      date, commodity, market, price, currency, unit
+
+    Raises:
+        HTTPException 503 if the file is missing.
+        HTTPException 500 if required columns cannot be found after normalisation.
+    """
+    try:
+        df = pd.read_csv(DATA_PATH, low_memory=False)
+    except FileNotFoundError:
+        raise _friendly_error(
+            status_code=503,
+            technical=f"WFP price dataset not found at {DATA_PATH}",
+            friendly=(
+                "Price data isn't available right now. We're working on it — "
+                "please try again shortly."
+            ),
+        )
+
+    # Normalise column names
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+    rename_map: dict[str, str] = {}
+    for col in df.columns:
+        if "date" in col and "date" not in rename_map.values():
+            rename_map[col] = "date"
+        elif col in ("cmname", "commodity", "cm_name", "item") and "commodity" not in rename_map.values():
+            rename_map[col] = "commodity"
+        elif col in ("mktname", "market", "mkt_name", "market_name") and "market" not in rename_map.values():
+            rename_map[col] = "market"
+        elif col == "price" and "price" not in rename_map.values():
+            rename_map[col] = "price"
+        elif col in ("cur", "currency", "currname", "currency_name") and "currency" not in rename_map.values():
+            rename_map[col] = "currency"
+        elif col in ("unit", "um_name", "umname", "unit_name") and "unit" not in rename_map.values():
+            rename_map[col] = "unit"
+        elif col in ("pricetype", "price_type") and "price_type" not in rename_map.values():
+            rename_map[col] = "price_type"
+        elif col == "category" and "category" not in rename_map.values():
+            rename_map[col] = "category"
+
+    df.rename(columns=rename_map, inplace=True)
+
+    required = {"date", "commodity", "market", "price"}
+    missing = required - set(df.columns)
+    if missing:
+        raise _friendly_error(
+            status_code=500,
+            technical=(
+                f"Dataset missing columns after normalisation: {sorted(missing)}. "
+                f"Found columns: {sorted(df.columns.tolist())}"
+            ),
+            friendly=(
+                "We hit a problem reading the latest price data. "
+                "Our team has been notified — please try again later."
+            ),
+        )
+
+    # Type coercion and cleaning
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df.dropna(subset=["date", "price"], inplace=True)
+    df = df[df["price"] > 0]  # Drop zero / negative prices
+
+    df["commodity"] = df["commodity"].str.strip().str.title()
+    df["market"] = df["market"].str.strip().str.title()
+
+    # Default optional columns if absent
+    if "currency" not in df.columns:
+        df["currency"] = "UGX"
+    if "unit" not in df.columns:
+        df["unit"] = "KG"
+    if "price_type" not in df.columns:
+        df["price_type"] = "Retail"
+
+    # Prefer retail prices; fall back to wholesale when retail is absent
+    if "price_type" in df.columns:
+        retail = df[df["price_type"].str.lower() == "retail"]
+        if not retail.empty:
+            df = retail.copy()
+
+    # --- Food-only scope --------------------------------------------------
+    # WFP's own "category" column is the authoritative signal here (see
+    # FOOD_CATEGORIES above) — roughly a fifth of this dataset is "non-food"
+    # (soap, batteries, hoes, firewood, exercise books, ...) and none of it
+    # belongs in a crop-price forecaster. Fall back to the keyword net only
+    # if category is missing entirely (older WFP export variants).
+    before = len(df)
+    if "category" in df.columns:
+        df = df[df["category"].astype(str).str.strip().str.lower().isin(FOOD_CATEGORIES)]
+    else:
+        df = df[df["commodity"].apply(_is_food_commodity)]
+    dropped = before - len(df)
+    if dropped:
+        logger.info(
+            "Filtered %d non-food observations out of WFP data (kept %d food rows).",
+            dropped, len(df),
+        )
+
+    df["source"] = "WFP"
+    logger.info(
+        "Loaded %d WFP food price observations from %s", len(df), os.path.basename(DATA_PATH)
+    )
+    return df.reset_index(drop=True)
+
+
+def _load_fews_net_csv() -> Optional[pd.DataFrame]:
+    """
+    Load the (already-normalised) FEWS NET CSV written by
+    services/fews_net_sync.py, if a validated one has ever synced.
+    Returns None rather than raising — FEWS NET is a supplementary feed,
+    not a hard dependency: a missing/stale file just means load_price_data()
+    falls back to WFP-only, exactly like before this feed existed.
+    """
+    fews_path = Path(fews_net_sync.DATA_PATH)
+    if not fews_path.exists():
+        return None
+    try:
+        df = pd.read_csv(fews_path, low_memory=False, parse_dates=["date"])
+    except Exception as exc:
+        logger.warning("FEWS NET dataset present but unreadable — skipping blend: %s", exc)
+        return None
+
+    required = {"date", "commodity", "market", "price"}
+    missing = required - set(df.columns)
+    if missing:
+        logger.warning("FEWS NET dataset missing columns %s — skipping blend.", sorted(missing))
+        return None
+
+    # FDW's "simple" fields extract carries no category column, so this is
+    # the keyword net (NON_FOOD_COMMODITY_KEYWORDS) rather than the WFP
+    # category allowlist — same food-only scope, different mechanism because
+    # the source gives us less to work with.
+    before = len(df)
+    df = df[df["commodity"].apply(_is_food_commodity)]
+    dropped = before - len(df)
+    if dropped:
+        logger.info(
+            "Filtered %d non-food observations out of FEWS NET data (kept %d food rows).",
+            dropped, len(df),
+        )
+
+    df["source"] = "FEWS_NET"
+    logger.info("Loaded %d FEWS NET price observations from %s", len(df), fews_path.name)
+    return df
+
+
+def load_price_data() -> pd.DataFrame:
+    """
+    Build the working price DataFrame: WFP's deep history blended with
+    FEWS NET's fresher, shallow-history feed where the two overlap on
+    (market, commodity, date).
+
+    On overlap, FEWS NET wins — it's the feed we sync more aggressively for
+    freshness, so if both sources reported the same market/commodity/date,
+    FEWS NET's number is the one more likely to reflect an up-to-date
+    collection pass rather than a delayed upstream republish. Everywhere
+    FEWS NET has no coverage (older history, or markets/commodities it
+    doesn't track), WFP fills the gap untouched.
+
+    Cached after first successful load — invalidated by either
+    wfp_sync.sync_if_updated() or fews_net_sync.sync_if_updated() when they
+    install new data, so a request right after a sync always sees it fresh.
+
+    Raises:
+        HTTPException 503 if the WFP file is missing.
+        HTTPException 500 if required columns cannot be found after normalisation.
+    """
+    if load_price_data._cache is not None:
+        return load_price_data._cache
+
+    wfp_df = _load_wfp_csv()
+    fews_df = _load_fews_net_csv()
+
+    if fews_df is None or fews_df.empty:
+        df = wfp_df
+    else:
+        combined = pd.concat([fews_df, wfp_df], ignore_index=True)
+        # fews_df listed first: drop_duplicates(keep="first") means FEWS NET
+        # wins any (market, commodity, date) collision, per the docstring above.
+        df = combined.drop_duplicates(subset=["market", "commodity", "date"], keep="first")
+        df = df.sort_values("date").reset_index(drop=True)
+        logger.info(
+            "Blended price data: %d WFP + %d FEWS NET -> %d observations after overlap resolution",
+            len(wfp_df), len(fews_df), len(df),
+        )
+
+    load_price_data._cache = df
+    return df
+
+
+load_price_data._cache = None
+
+
+# =============================================================================
+# Filtering helpers
+# =============================================================================
+
+def _filter_subset(
+    df: pd.DataFrame,
+    commodity: str,
+    market: str,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Filter the full DataFrame to the requested commodity × market.
+
+    Fallback chain:
+      1. Exact commodity + market match
+      2. Commodity only (any market) — use the most common market
+      3. Raise 404
+
+    Returns:
+        (filtered_df, resolved_market_name)
+    """
+    c_lower = commodity.lower()
+    m_lower = market.lower()
+
+    subset = df[
+        (df["commodity"].str.lower() == c_lower)
+        & (df["market"].str.lower() == m_lower)
+    ].copy()
+
+    if not subset.empty:
+        return subset.sort_values("date").reset_index(drop=True), market
+
+    # Fallback: commodity in any market
+    subset = df[df["commodity"].str.lower() == c_lower].copy()
+    if not subset.empty:
+        # Best CURRENT regular market, not merely the most frequent one (which
+        # was a 2018 Lira series for Maize).
+        resolved_market = best_market(df, commodity) or subset["market"].mode()[0]
+        logger.warning(
+            "No data for %s in %s — falling back to %s",
+            commodity, market, resolved_market,
+        )
+        subset = subset[subset["market"] == resolved_market].copy()
+        return subset.sort_values("date").reset_index(drop=True), resolved_market
+
+    raise _friendly_error(
+        status_code=404,
+        technical=f"No price data found for commodity='{commodity}' market='{market}'.",
+        friendly=(
+            f"We don't have price data for '{commodity}' yet. "
+            f"Check GET /forecasts/commodities for what's currently covered."
+        ),
+    )
+
+
+def _latest_metadata(subset: pd.DataFrame) -> tuple[str, str]:
+    """Extract currency and unit from the most recent row in the subset."""
+    latest = subset.iloc[-1]
+    currency = str(latest.get("currency", "UGX") or "UGX")
+    unit = str(latest.get("unit", "KG") or "KG")
+    return currency, unit
+
+
+def _freshness(date_value: pd.Timestamp) -> tuple[int, str]:
+    lag_days = max(0, (pd.Timestamp.now(tz="UTC").normalize().tz_localize(None) - date_value.normalize()).days)
+    if lag_days <= 7:
+        return lag_days, "live"
+    if lag_days <= 45:
+        return lag_days, "recent"
+    return lag_days, "stale"
+
+
+def _training_window(subset: pd.DataFrame, days: int = 730) -> pd.DataFrame:
+    """Return only the last `days` of data for model training."""
+    cutoff = subset["date"].max() - timedelta(days=days)
+    return subset[subset["date"] >= cutoff][["date", "price"]].copy()
+
+
+# =============================================================================
+# Trend and alert helpers
+# =============================================================================
+
+def get_trend_label(prices: list[float], window: int = 5) -> str:
+    """
+    Determine price direction from the last `window` predicted points.
+
+    Using a short trailing window rather than the full horizon prevents
+    a single early spike from masking a sustained fall (or vice versa).
+
+    Returns "rising", "falling", or "stable".
+    """
+    tail = prices[-window:] if len(prices) >= window else prices
+    if len(tail) < 2:
+        return "stable"
+    slope = np.polyfit(range(len(tail)), tail, 1)[0]
+    mean_price = np.mean(tail) or 1e-9
+    pct_slope = slope / mean_price
+    if pct_slope > 0.005:
+        return "rising"
+    if pct_slope < -0.005:
+        return "falling"
+    return "stable"
+
+
+def _pct_change(last_actual: float, last_predicted: float) -> float:
+    """Percentage change from the last observed price to the final forecast."""
+    if last_actual <= 0:
+        return 0.0
+    return round(((last_predicted - last_actual) / last_actual) * 100, 2)
+
+
+def build_alert(
+    trend: str, commodity: str, pct_change: float
+) -> Optional[str]:
+    """
+    Return a farmer-friendly alert string when the price move is significant.
+    Returns None when the change is within the quiet threshold.
+    """
+    if abs(pct_change) < ALERT_THRESHOLD_PCT:
+        return None
+    direction = "rise" if trend == "rising" else "fall"
+    emoji = "📈" if trend == "rising" else "📉"
+    return (
+        f"{emoji} {commodity} prices are expected to {direction} by "
+        f"~{abs(pct_change):.1f}% over the forecast period. "
+        f"{'Consider selling soon.' if trend == 'rising' else 'Good time to buy inputs.'}"
+    )
+
+
+def _clamp_to_historical_range(fc: pd.DataFrame, hist_prices: pd.Series) -> pd.DataFrame:
+    """
+    Defense-in-depth: whatever prophet_forecast()/xgb_residual_correction()
+    produced, never let a forecast point escape the real-world price
+    universe for this commodity/market. This is deliberately a generous
+    leash (historical range + a same-size buffer on each side), not a tight
+    one — it's meant to catch genuine model blow-ups (e.g. under-identified
+    seasonality on sparse data), not to suppress legitimate trend movement.
+    """
+    hist_min = float(hist_prices.min())
+    hist_max = float(hist_prices.max())
+    hist_range = hist_max - hist_min
+    buffer = hist_range if hist_range > 0 else max(hist_max * 0.5, 1.0)
+    floor = max(0.0, hist_min - buffer)
+    ceiling = hist_max + buffer
+
+    clamped = fc.copy()
+    for col in ("yhat", "yhat_lower", "yhat_upper"):
+        clamped[col] = clamped[col].clip(lower=floor, upper=ceiling)
+    return clamped
+
+
+def _clamp_confidence(yhat: float, lower: float, upper: float) -> float:
+    """
+    Derive a confidence score in [0.0, 1.0] from the prediction interval width.
+
+    Wide interval  → low confidence
+    Narrow interval → high confidence
+
+    The raw formula can exceed [0,1] for very narrow or very wide intervals,
+    so we clamp explicitly.
+    """
+    interval_width = upper - lower
+    midpoint = abs(yhat) or 1e-9
+    raw = 1.0 - (interval_width / (2 * midpoint))
+    return round(max(0.0, min(1.0, raw)), 3)
+
+
+# =============================================================================
+# Forecasting engines
+# =============================================================================
+
+def prophet_forecast(series: pd.DataFrame, horizon: int) -> tuple[pd.DataFrame, str]:
+    """
+    Run Facebook Prophet on a (date, price) time series.
+
+    Args:
+        series:  DataFrame with columns ["date", "price"], sorted ascending.
+        horizon: Number of days ahead to forecast.
+
+    Returns:
+        (forecast_df, model_label)
+        forecast_df has columns: ds, yhat, yhat_lower, yhat_upper
+        model_label is "prophet" or "prophet+xgb"
+
+    Falls back to linear_extrapolation() if Prophet is not installed.
+    """
+    # The production default is the shared, backtested pipeline.  It is
+    # deliberately independent of Prophet: WFP observations are irregular
+    # and generally too sparse to identify daily/yearly Prophet seasonality.
+    try:
+        from ml.pipeline import forecast_series
+
+        result = forecast_series(series, horizon)
+        logger.info(
+            "Backtested ensemble forecast: folds=%d validation_mae=%.2f",
+            result.folds,
+            result.mae,
+        )
+        return result.forecast, result.model
+    except (ImportError, ValueError):
+        logger.warning("Shared ML pipeline unavailable; using legacy fallback.")
+
+    try:
+        from prophet import Prophet  # type: ignore
+
+        train = series.rename(columns={"date": "ds", "price": "y"})
+
+        n_obs = len(train)
+        span_days = (train["ds"].max() - train["ds"].min()).days
+
+        # Yearly seasonality needs at least ~2 full cycles to be reliably
+        # identified — Prophet itself warns "under-identified" below 730
+        # days of history. With WFP/FEWS NET's monthly cadence, a series
+        # can clear MIN_OBSERVATIONS (10) while still being far short of
+        # that: 24 monthly points spanning <2 years previously produced a
+        # forecast that swung to -UGX 43,700 internally before the yhat>=0
+        # clip turned it into a smooth-looking but fabricated 0→30k→0 hump,
+        # against a real historical range of UGX 1,900-5,000. Only turn
+        # yearly seasonality on once there's enough span AND enough points
+        # to actually constrain it, and even then use a low Fourier order
+        # (4 terms, not the default 10) plus a tighter seasonality prior —
+        # sparse monthly data can't support 10 terms' worth of free
+        # parameters without overfitting to noise.
+        enable_yearly = span_days >= 730 and n_obs >= 24
+        sparse = n_obs < 60
+
+        m = Prophet(
+            yearly_seasonality=4 if enable_yearly else False,
+            weekly_seasonality=False,
+            daily_seasonality=False,
+            changepoint_prior_scale=0.05 if sparse else 0.15,  # trend flexibility
+            seasonality_prior_scale=3.0 if sparse else 10.0,   # seasonality amplitude
+            interval_width=0.90,            # 90 % prediction interval
+        )
+        m.fit(train)
+
+        # WFP price data is published monthly, so the freshest observation on
+        # disk is routinely 4-8 weeks old. make_future_dataframe() builds its
+        # future window off that last *data* date, not off today — so a stale
+        # dataset silently produced a "forecast" dated in the past by the time
+        # anyone viewed it. Anchor the future window to max(last data date,
+        # today) instead, so the horizon always starts tomorrow in the real
+        # world, regardless of how stale the underlying dataset is.
+        today = pd.Timestamp.now().normalize()
+        last_data_date = train["ds"].max()
+        anchor = max(last_data_date, today)
+        future_dates = pd.date_range(
+            start=anchor + timedelta(days=1), periods=horizon, freq="D"
+        )
+        future = pd.concat(
+            [train[["ds"]], pd.DataFrame({"ds": future_dates})],
+            ignore_index=True,
+        )
+        raw_fc = m.predict(future)
+        fc = (
+            raw_fc[raw_fc["ds"].isin(future_dates)]
+            [["ds", "yhat", "yhat_lower", "yhat_upper"]]
+            .sort_values("ds")
+            .reset_index(drop=True)
+        )
+        fc["yhat"]       = fc["yhat"].clip(lower=0)
+        fc["yhat_lower"] = fc["yhat_lower"].clip(lower=0)
+        # Full historical-range clamp (covers yhat_upper too, and the
+        # xgb-corrected output below) happens centrally in
+        # _build_forecast_response() via _clamp_to_historical_range().
+
+        # Attempt XGBoost residual correction on top of Prophet
+        fc, label = xgb_residual_correction(series, fc)
+        return fc, label
+
+    except ImportError:
+        logger.warning("Prophet not installed — using linear extrapolation fallback.")
+        return linear_extrapolation(series, horizon), "linear"
+    except Exception as exc:
+        logger.exception("Prophet failed unexpectedly: %s — falling back.", exc)
+        return linear_extrapolation(series, horizon), "linear"
+
+
+def xgb_residual_correction(
+    series: pd.DataFrame,
+    prophet_fc: pd.DataFrame,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Optional XGBoost layer that learns Prophet's residuals on the training
+    set and adjusts the forecast accordingly.
+
+    This is a lightweight correction — Prophet handles seasonality and trend,
+    XGBoost corrects systematic over/under-forecasting patterns.
+
+    Features used:
+      - day_of_week, month, day_of_year  (calendar features)
+      - lag_7, lag_14, lag_30            (recent price memory)
+
+    If XGBoost is not installed or training data is insufficient, returns
+    the original Prophet forecast unchanged.
+    """
+    try:
+        from xgboost import XGBRegressor  # type: ignore
+
+        prices = series.set_index("date")["price"].sort_index()
+
+        if len(prices) < 30:
+            return prophet_fc, "prophet"
+
+        # Build feature matrix for the training period
+        feat_rows = []
+        targets = []
+        price_index = prices.index.tolist()
+
+        for i, dt in enumerate(price_index):
+            if i < 30:
+                continue
+            actual = prices.iloc[i]
+            # Approximate what Prophet would have predicted (use linear interp)
+            prophet_approx = prices.iloc[max(0, i - 7) : i].mean()
+            residual = actual - prophet_approx
+            feat_rows.append({
+                "dow":         dt.dayofweek,
+                "month":       dt.month,
+                "doy":         dt.dayofyear,
+                "lag7":        prices.iloc[i - 7],
+                "lag14":       prices.iloc[i - 14],
+                "lag30":       prices.iloc[i - 30],
+                "prophet_hat": prophet_approx,
+            })
+            targets.append(residual)
+
+        if len(feat_rows) < 20:
+            return prophet_fc, "prophet"
+
+        X_train = pd.DataFrame(feat_rows)
+        y_train = np.array(targets)
+
+        model = XGBRegressor(
+            n_estimators=50,
+            max_depth=3,
+            learning_rate=0.1,
+            subsample=0.8,
+            random_state=42,
+            verbosity=0,
+        )
+        model.fit(X_train, y_train)
+
+        # Apply correction to forecast rows
+        last_prices = prices.iloc[-30:].values
+        corrected_fc = prophet_fc.copy()
+
+        for i, row in corrected_fc.iterrows():
+            dt = pd.Timestamp(row["ds"])
+            feat = {
+                "dow":         dt.dayofweek,
+                "month":       dt.month,
+                "doy":         dt.dayofyear,
+                "lag7":        last_prices[-7] if len(last_prices) >= 7 else last_prices[-1],
+                "lag14":       last_prices[-14] if len(last_prices) >= 14 else last_prices[-1],
+                "lag30":       last_prices[-30] if len(last_prices) >= 30 else last_prices[-1],
+                "prophet_hat": row["yhat"],
+            }
+            correction = float(model.predict(pd.DataFrame([feat]))[0])
+            corrected_fc.at[i, "yhat"]       = max(row["yhat"] + correction, 0)
+            corrected_fc.at[i, "yhat_lower"] = max(row["yhat_lower"] + correction * 0.5, 0)
+            corrected_fc.at[i, "yhat_upper"] = max(row["yhat_upper"] + correction * 1.5, 0)
+
+        logger.info("XGBoost residual correction applied.")
+        return corrected_fc, "prophet+xgb"
+
+    except ImportError:
+        return prophet_fc, "prophet"
+    except Exception as exc:
+        logger.warning("XGBoost correction failed (%s) — using Prophet output.", exc)
+        return prophet_fc, "prophet"
+
+
+def linear_extrapolation(series: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """
+    Simple linear regression extrapolation — the always-available fallback.
+
+    Used when Prophet is not installed or raises an unexpected error.
+    Uncertainty band = 10 % of historical standard deviation (conservative).
+    """
+    prices = series["price"].values
+    x = np.arange(len(prices))
+    slope, intercept = np.polyfit(x, prices, 1)
+    std_band = np.std(prices) * 0.10
+
+    # Same staleness fix as prophet_forecast(): anchor to today, not to the
+    # dataset's last (possibly weeks-old) observation date.
+    today = pd.Timestamp.now().normalize()
+    last_date = max(series["date"].max(), today)
+    rows = []
+    for i in range(1, horizon + 1):
+        yhat = intercept + slope * (len(prices) + i)
+        yhat = max(yhat, 0.0)
+        rows.append(
+            {
+                "ds": last_date + timedelta(days=i),
+                "yhat": yhat,
+                "yhat_lower": max(yhat - std_band, 0.0),
+                "yhat_upper": yhat + std_band,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def naive_forecast(series: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """
+    Deliberately dumb fallback for series between ABSOLUTE_MIN_OBSERVATIONS
+    and MIN_OBSERVATIONS: too little history to trust Prophet/XGBoost's
+    seasonality and trend fitting, but not so little that we should refuse
+    outright and leave the farmer with nothing.
+
+    Point forecast = last observed price, held flat (a seasonal-naive model
+    with no more than a handful of points has no basis for claiming a trend).
+    The interval widens linearly over the horizon using the historical
+    std-dev, growing wider the further out the forecast reaches — reflecting
+    honestly that confidence in "flat" erodes with time, rather than
+    presenting a fixed band that looks as confident on day 90 as on day 1.
+
+    This is intentionally simpler than linear_extrapolation() (which still
+    fits a trend line) — with this few points a fitted slope is mostly noise.
+    """
+    prices = series["price"].values
+    last_price = float(prices[-1])
+    std = float(np.std(prices)) if len(prices) > 1 else last_price * 0.1
+
+    today = pd.Timestamp.now().normalize()
+    last_date = max(series["date"].max(), today)
+    rows = []
+    for i in range(1, horizon + 1):
+        growth = 1.0 + (i / horizon) * 0.5  # band widens up to 1.5x by the horizon's end
+        band = std * growth
+        rows.append(
+            {
+                "ds": last_date + timedelta(days=i),
+                "yhat": last_price,
+                "yhat_lower": max(last_price - band, 0.0),
+                "yhat_upper": last_price + band,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# Route helpers
+# =============================================================================
+
+def _build_forecast_response(
+    commodity: str,
+    market: str,
+    train: pd.DataFrame,
+    full_subset: pd.DataFrame,
+    horizon: int,
+) -> ForecastResponse:
+    """
+    Run the forecast pipeline and assemble a ForecastResponse.
+    Extracted so both get_forecast() and compare_markets() share the same logic.
+
+    Below MIN_OBSERVATIONS (but at/above ABSOLUTE_MIN_OBSERVATIONS) this
+    drops to naive_forecast() instead of Prophet/XGBoost — see naive_forecast()
+    docstring — and marks the response data_quality="limited" so callers know
+    not to over-trust it, rather than either refusing outright or quietly
+    handing back a Prophet forecast fit on almost nothing.
+    """
+    currency, unit = _latest_metadata(full_subset)
+    latest_date = pd.Timestamp(full_subset["date"].max())
+    lag_days, freshness = _freshness(latest_date)
+    latest_row = full_subset.loc[full_subset["date"].idxmax()]
+    price_source = str(latest_row.get("source", "WFP") or "WFP")
+    sparse = len(train) < MIN_OBSERVATIONS
+
+    if sparse:
+        fc = naive_forecast(train, horizon)
+        model_used = "naive"
+    else:
+        fc, model_used = prophet_forecast(train, horizon)
+        fc = _clamp_to_historical_range(fc, train["price"])
+
+    # Data-driven interval sizing from the quant/ module — see
+    # services/quant_bridge.py. Falls back to the heuristic
+    # _clamp_confidence() below whenever there isn't enough history for a
+    # walk-forward backtest, xgboost isn't installed, or anything about the
+    # bridge fails; forecasts.py never depends on quant/ being available.
+    quant_result = None if sparse else quant_bridge.quant_confidence(train, horizon)
+
+    points: list[ForecastPoint] = []
+    for idx, (_, row) in enumerate(fc.iterrows()):
+        if quant_result is not None:
+            # Backtest residuals calibrate the first-step error. Uncertainty
+            # must still grow with lead time rather than presenting the same
+            # confidence for tomorrow and day 90.
+            lead_scale = float(np.sqrt(idx + 1))
+            lower, upper = quant_bridge.apply_halfwidth(
+                float(row["yhat"]), quant_result.halfwidth * lead_scale
+            )
+            conf = quant_result.confidence
+        else:
+            lower, upper = float(row["yhat_lower"]), float(row["yhat_upper"])
+            conf = _clamp_confidence(row["yhat"], lower, upper)
+
+        points.append(
+            ForecastPoint(
+                date=pd.Timestamp(row["ds"]).strftime("%Y-%m-%d"),
+                predicted_price=round(float(row["yhat"]), 2),
+                lower_bound=round(lower, 2),
+                upper_bound=round(upper, 2),
+                confidence=conf,
+            )
+        )
+
+    predicted_prices = [p.predicted_price for p in points]
+    trend = get_trend_label(predicted_prices)
+    last_actual = float(train["price"].iloc[-1])
+    last_predicted = predicted_prices[-1]
+    pct = _pct_change(last_actual, last_predicted)
+    alert = build_alert(trend, commodity, pct)
+
+    data_quality = "limited" if sparse else "sufficient"
+    data_quality_note = (
+        (
+            f"Only {len(train)} price observations are available for {commodity} in "
+            f"{market}, so this forecast holds the last known price flat rather than "
+            f"predicting a trend. Treat it as a rough guide, not a firm prediction."
+        )
+        if sparse
+        else None
+    )
+
+    logger.info(
+        "Forecast generated | commodity=%s market=%s horizon=%d model=%s trend=%s "
+        "pct=%.1f data_quality=%s quant_wired=%s",
+        commodity, market, horizon, model_used, trend, pct, data_quality,
+        quant_result is not None,
+    )
+
+    return ForecastResponse(
+        commodity=commodity,
+        market=market,
+        currency=currency,
+        unit=unit,
+        horizon_days=horizon,
+        observations_used=len(train),
+        forecast=points,
+        trend=trend,
+        pct_change=pct,
+        alert=alert,
+        model_used=model_used,
+        generated_at=datetime.utcnow().isoformat() + "Z",
+        data_quality=data_quality,
+        data_quality_note=data_quality_note,
+        latest_observation_date=latest_date.strftime("%Y-%m-%d"),
+        data_as_of=latest_date.strftime("%Y-%m-%d"),
+        price_source=price_source,
+        source_lag_days=lag_days,
+        freshness_status=freshness,
+    )
+
+
+# =============================================================================
+# Routes
+# =============================================================================
+
+@router.get("/sync/status", response_model=SyncStatusResponse)
+def get_sync_status():
+    """
+    When was the price dataset last synced from HDX, and what did HDX report
+    for it at that time. No network call — reads the local sync-state file.
+    """
+    return SyncStatusResponse(**wfp_sync.last_sync_info())
+
+
+@router.post("/sync", response_model=SyncTriggerResponse)
+def trigger_sync(force: bool = Query(default=False, description="Skip the metadata check and re-download unconditionally")):
+    """
+    On-demand version of the background sync job (see services/wfp_sync.py
+    and its scheduled run in main.py's startup handler). Checks HDX's
+    lightweight resource metadata first — only downloads the ~3MB CSV if
+    that metadata shows the upstream file actually changed, unless
+    `force=true`. On a real update, also clears the cached DataFrame and
+    forecast cache so the very next request already sees fresh data.
+    """
+    updated = wfp_sync.sync_if_updated(force=force)
+    detail = (
+        "New data downloaded and applied."
+        if updated
+        else ("Already up to date — no download needed." if not force else "Sync failed; see server logs.")
+    )
+    return SyncTriggerResponse(
+        updated=updated,
+        detail=detail,
+        status=SyncStatusResponse(**wfp_sync.last_sync_info()),
+    )
+
+
+@router.get("/sync/fews-net/status", response_model=FewsNetSyncStatusResponse)
+def get_fews_net_sync_status():
+    """
+    When was the supplementary FEWS NET feed last synced, and what it
+    covered at that time. No network call — reads the local sync-state file.
+    """
+    return FewsNetSyncStatusResponse(**fews_net_sync.last_sync_info())
+
+
+@router.post("/sync/fews-net", response_model=FewsNetSyncStatusResponse)
+def trigger_fews_net_sync(force: bool = Query(default=False, description="Re-fetch and re-validate even if nothing looks changed")):
+    """
+    On-demand version of the background FEWS NET sync job (see
+    services/fews_net_sync.py and its scheduled run in main.py's startup
+    handler). Fetches the FDW extract for the configured lookback window,
+    validates it, and — only if it's new or `force=true` — swaps it in and
+    clears the forecast cache so the next request blends it immediately.
+    """
+    fews_net_sync.sync_if_updated(force=force)
+    return FewsNetSyncStatusResponse(**fews_net_sync.last_sync_info())
+
+
+@router.post("/sync/all", response_model=DataFreshnessResponse)
+def trigger_all_syncs():
+    """Refresh every configured live feed, then return the resulting coverage."""
+    wfp_sync.sync_if_updated()
+    fews_net_sync.sync_if_updated()
+    weather_sync.sync_if_updated()
+    return get_data_freshness()
+
+
+@router.get("/data-status", response_model=DataFreshnessResponse)
+def get_data_freshness():
+    """Return exact price coverage and last-sync timestamps; never implies today."""
+    df = load_price_data()
+    latest = pd.Timestamp(df["date"].max()) if not df.empty else None
+    lag, freshness = _freshness(latest) if latest is not None else (None, "unknown")
+    latest_row = df.loc[df["date"].idxmax()] if latest is not None else None
+    weather_state = weather_sync.last_sync_info()
+    fews_state = fews_net_sync.last_sync_info()
+    return DataFreshnessResponse(
+        price_latest_date=latest.strftime("%Y-%m-%d") if latest is not None else None,
+        price_source=str(latest_row.get("source", "WFP") or "WFP") if latest_row is not None else None,
+        price_observations=len(df),
+        price_lag_days=lag,
+        price_freshness=freshness,
+        wfp_synced_at=wfp_sync.last_sync_info().get("synced_at"),
+        fews_net_synced_at=fews_state.get("synced_at"),
+        fews_net_latest_date=fews_state.get("max_date"),
+        weather_synced_at=weather_state.get("synced_at"),
+        weather_forecast_through=weather_state.get("forecast_through"),
+        checked_at=datetime.utcnow().isoformat() + "Z",
+    )
+
+
+@router.get("/sources", response_model=SourcesResponse)
+def list_sources():
+    """
+    Every price-data source AgriGuard pulls from (auto-syncing today) and
+    every credible source that's been evaluated and logged for future
+    integration but isn't wired up yet. See services/data_sources.py.
+    """
+    def _to_info(s: data_sources.DataSource) -> DataSourceInfo:
+        return DataSourceInfo(
+            name=s.name,
+            url=s.url,
+            status=s.status.value,
+            scope=s.scope,
+            cadence_note=s.cadence_note,
+            credibility_note=s.credibility_note,
+            note=s.catalogued_note or None,
+        )
+
+    return SourcesResponse(
+        active=[_to_info(s) for s in data_sources.active_sources()],
+        catalogued=[_to_info(s) for s in data_sources.catalogued_sources()],
+    )
+
+
+@router.get("/commodities", response_model=CommodityListResponse)
+def list_commodities():
+    """
+    Return all commodities and markets available in the price dataset.
+
+    Use this to discover valid values for the `commodity` and `market`
+    parameters on the other endpoints.
+    """
+    df = load_price_data()
+    return CommodityListResponse(
+        commodities=sorted(df["commodity"].unique().tolist()),
+        markets=sorted(df["market"].unique().tolist()),
+        total_observations=len(df),
+    )
+
+
+@router.get("/history/{commodity}", response_model=HistoryResponse)
+def get_price_history(
+    commodity: str,
+    market: str = Query(default="Kampala", description="Market name"),
+    days: int = Query(
+        default=365,
+        ge=30,
+        le=1825,
+        description="Number of historical days to return (30–1825)",
+    ),
+):
+    """
+    Return historical prices for a commodity × market pair.
+
+    Useful for rendering sparklines and trend charts in the dashboard.
+    Returns up to `days` of daily observations, most recent last.
+
+    Example: `/forecasts/history/Maize?market=Kampala&days=180`
+    """
+    df = load_price_data()
+    commodity_title = resolve_commodity(df, commodity)
+    requested_market = (market or "").strip().title()
+    market_title = requested_market or best_market(df, commodity_title) or ""
+
+    subset, resolved_market = _filter_subset(df, commodity_title, market_title)
+    fallback_note = None
+    if requested_market and resolved_market.lower() != requested_market.lower():
+        fallback_note = (
+            f"No data for {commodity_title} in {requested_market}; showing "
+            f"{resolved_market} instead."
+        )
+    currency, unit = _latest_metadata(subset)
+
+    cutoff = subset["date"].max() - timedelta(days=days)
+    window = subset[subset["date"] >= cutoff]
+
+    history = [
+        HistoryPoint(
+            date=row["date"].strftime("%Y-%m-%d"),
+            price=round(float(row["price"]), 2),
+        )
+        for _, row in window.iterrows()
+    ]
+
+    return HistoryResponse(
+        commodity=commodity_title,
+        market=resolved_market,
+        currency=currency,
+        unit=unit,
+        history=history,
+    )
+
+
+# In-memory cache of built forecasts, keyed by (commodity, market, horizon).
+# Prophet + XGBoost fitting is the expensive part of this endpoint (often
+# several seconds, more on a cold process), and the same combo is requested
+# repeatedly as users click around the dashboard — so cache the response.
+_FORECAST_CACHE: dict[tuple[str, str, int], tuple[float, "ForecastResponse"]] = {}
+_FORECAST_CACHE_TTL_SECONDS = 900
+
+
+def _with_fallback_note(response: "ForecastResponse", note: Optional[str]) -> "ForecastResponse":
+    """Tell the caller when the requested market had no data and another was used."""
+    if not note:
+        return response
+    return response.model_copy(update={
+        "data_quality_note": " ".join(filter(None, [note, response.data_quality_note])),
+    })
+
+
+@router.get("/{commodity}", response_model=ForecastResponse)
+def get_forecast(
+    commodity: str,
+    market: Optional[str] = Query(
+        default=None,
+        description="Market name e.g. Mbarara, Gulu, Arua. Omit to auto-pick the best market with current data.",
+    ),
+    horizon: int = Query(
+        default=14,
+        ge=1,
+        le=90,
+        description="Forecast horizon in days (1–90). Beyond 30 days confidence drops sharply.",
+    ),
+):
+    """
+    Forecast crop prices for a given commodity and market.
+
+    Returns a daily price forecast for the next `horizon` days,
+    with 90 % prediction intervals, a trend label, and an alert
+    when the predicted price movement exceeds 5 %.
+
+    **Commodity examples:** `Maize`, `Beans`, `Tomatoes`, `Cassava`
+    **Market examples:** `Mbarara`, `Gulu`, `Arua`, `Mbale`
+
+    Use `GET /forecasts/commodities` to discover all valid values.
+    """
+    df = load_price_data()
+    commodity_title = resolve_commodity(df, commodity)
+    requested_market = (market or "").strip().title()
+    market_title = requested_market or best_market(df, commodity_title) or ""
+
+    subset, resolved_market = _filter_subset(df, commodity_title, market_title)
+    fallback_note = None
+    if requested_market and resolved_market.lower() != requested_market.lower():
+        fallback_note = (
+            f"No data for {commodity_title} in {requested_market}; showing "
+            f"{resolved_market} instead."
+        )
+
+    cache_key = (commodity_title, resolved_market, horizon)
+    cached = _FORECAST_CACHE.get(cache_key)
+    if cached is not None:
+        cached_at, cached_response = cached
+        if time.monotonic() - cached_at < _FORECAST_CACHE_TTL_SECONDS:
+            return _with_fallback_note(cached_response, fallback_note)
+        _FORECAST_CACHE.pop(cache_key, None)
+
+    train = _training_window(subset)
+
+    # Below ABSOLUTE_MIN_OBSERVATIONS there's genuinely nothing defensible to
+    # say (not even "flat") — that's still a hard refusal. Between that floor
+    # and MIN_OBSERVATIONS, _build_forecast_response() below handles it via
+    # naive_forecast() + data_quality="limited" instead of failing.
+    if len(train) < ABSOLUTE_MIN_OBSERVATIONS:
+        raise _friendly_error(
+            status_code=422,
+            technical=(
+                f"Only {len(train)} observations for '{commodity_title}' in "
+                f"'{resolved_market}' — below ABSOLUTE_MIN_OBSERVATIONS={ABSOLUTE_MIN_OBSERVATIONS}."
+            ),
+            friendly=(
+                f"There's too little price history for {commodity_title} in {resolved_market} "
+                f"to forecast yet. Try a different market, or check back once more prices "
+                f"have been recorded."
+            ),
+        )
+
+    response = _build_forecast_response(
+        commodity=commodity_title,
+        market=resolved_market,
+        train=train,
+        full_subset=subset,
+        horizon=horizon,
+    )
+    _FORECAST_CACHE[cache_key] = (time.monotonic(), response)
+    return _with_fallback_note(response, fallback_note)
+
+
+@router.get("/compare/{commodity}", response_model=CompareResponse)
+def compare_markets(
+    commodity: str,
+    markets: Optional[str] = Query(
+        default=None,
+        description="Comma-separated market names to compare (max 6). Omit to compare the top markets with current data.",
+    ),
+    horizon: int = Query(
+        default=14,
+        ge=1,
+        le=30,
+        description="Forecast horizon in days (1–30)",
+    ),
+):
+    """
+    Compare price forecasts for one commodity across multiple markets.
+
+    Helps farmers and traders decide the best market to sell or buy in.
+    Markets with insufficient data are skipped and listed in `skipped_markets`.
+
+    **Example:**
+    `/forecasts/compare/Maize?markets=Mbarara,Gulu,Arua&horizon=14`
+
+    Returns partial results if at least one market has enough data.
+    Use `GET /forecasts/commodities` to see which markets have data.
+    """
+    df = load_price_data()
+    commodity_title = resolve_commodity(df, commodity)
+
+    # Parse and deduplicate market list (max 6 to keep response times sane)
+    if markets:
+        market_list = list(dict.fromkeys(
+            m.strip().title() for m in markets.split(",") if m.strip()
+        ))[:6]
+    else:
+        market_list = regular_markets(df, commodity_title, min_obs=4, limit=3)
+
+    results: list[ForecastResponse] = []
+    skipped: list[str] = []
+
+    for mkt in market_list:
+        try:
+            subset, resolved_market = _filter_subset(df, commodity_title, mkt)
+            train = _training_window(subset)
+
+            if len(train) < ABSOLUTE_MIN_OBSERVATIONS:
+                logger.warning(
+                    "Skipping %s for %s — only %d observations (below the absolute floor of %d).",
+                    mkt, commodity_title, len(train), ABSOLUTE_MIN_OBSERVATIONS,
+                )
+                skipped.append(mkt)
+                continue
+
+            result = _build_forecast_response(
+                commodity=commodity_title,
+                market=resolved_market,
+                train=train,
+                full_subset=subset,
+                horizon=horizon,
+            )
+            results.append(result)
+
+        except HTTPException:
+            skipped.append(mkt)
+        except Exception as exc:
+            logger.exception("Unexpected error forecasting %s in %s: %s", commodity_title, mkt, exc)
+            skipped.append(mkt)
+
+    if not results:
+        raise _friendly_error(
+            status_code=404,
+            technical=(
+                f"No forecast data for commodity='{commodity_title}' "
+                f"in any of markets={market_list}."
+            ),
+            friendly=(
+                f"We couldn't find enough price data for {commodity_title} in any of "
+                f"the markets you asked about. Check GET /forecasts/commodities for "
+                f"what's currently covered."
+            ),
+        )
+
+    return CompareResponse(
+        commodity=commodity_title,
+        horizon_days=horizon,
+        results=results,
+        skipped_markets=skipped,
+    )

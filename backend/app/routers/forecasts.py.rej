@@ -1,0 +1,139 @@
+--- AgriGuard-main/backend/app/routers/forecasts.py	2026-09-28 09:09:45.000000000 +0000
++++ backend/app/routers/forecasts.py	2026-10-05 10:16:34.360285334 +0000
+@@ -473,7 +477,9 @@
+     # Fallback: commodity in any market
+     subset = df[df["commodity"].str.lower() == c_lower].copy()
+     if not subset.empty:
+-        resolved_market = subset["market"].mode()[0]
++        # Best CURRENT regular market, not merely the most frequent one (which
++        # was a 2018 Lira series for Maize).
++        resolved_market = best_market(df, commodity) or subset["market"].mode()[0]
+         logger.warning(
+             "No data for %s in %s — falling back to %s",
+             commodity, market, resolved_market,
+@@ -1144,10 +1150,17 @@
+     Example: `/forecasts/history/Maize?market=Kampala&days=180`
+     """
+     df = load_price_data()
+-    commodity_title = commodity.strip().title()
+-    market_title = market.strip().title()
++    commodity_title = resolve_commodity(df, commodity)
++    requested_market = (market or "").strip().title()
++    market_title = requested_market or best_market(df, commodity_title) or ""
+ 
+     subset, resolved_market = _filter_subset(df, commodity_title, market_title)
++    fallback_note = None
++    if requested_market and resolved_market.lower() != requested_market.lower():
++        fallback_note = (
++            f"No data for {commodity_title} in {requested_market}; showing "
++            f"{resolved_market} instead."
++        )
+     currency, unit = _latest_metadata(subset)
+ 
+     cutoff = subset["date"].max() - timedelta(days=days)
+@@ -1178,12 +1191,21 @@
+ _FORECAST_CACHE_TTL_SECONDS = 900
+ 
+ 
++def _with_fallback_note(response: "ForecastResponse", note: Optional[str]) -> "ForecastResponse":
++    """Tell the caller when the requested market had no data and another was used."""
++    if not note:
++        return response
++    return response.model_copy(update={
++        "data_quality_note": " ".join(filter(None, [note, response.data_quality_note])),
++    })
++
++
+ @router.get("/{commodity}", response_model=ForecastResponse)
+ def get_forecast(
+     commodity: str,
+-    market: str = Query(
+-        default="Kampala",
+-        description="Market name e.g. Kampala, Mbarara, Gulu",
++    market: Optional[str] = Query(
++        default=None,
++        description="Market name e.g. Mbarara, Gulu, Arua. Omit to auto-pick the best market with current data.",
+     ),
+     horizon: int = Query(
+         default=14,
+@@ -1200,22 +1222,29 @@
+     when the predicted price movement exceeds 5 %.
+ 
+     **Commodity examples:** `Maize`, `Beans`, `Tomatoes`, `Cassava`
+-    **Market examples:** `Kampala`, `Mbarara`, `Gulu`, `Mbale`
++    **Market examples:** `Mbarara`, `Gulu`, `Arua`, `Mbale`
+ 
+     Use `GET /forecasts/commodities` to discover all valid values.
+     """
+     df = load_price_data()
+-    commodity_title = commodity.strip().title()
+-    market_title = market.strip().title()
++    commodity_title = resolve_commodity(df, commodity)
++    requested_market = (market or "").strip().title()
++    market_title = requested_market or best_market(df, commodity_title) or ""
+ 
+     subset, resolved_market = _filter_subset(df, commodity_title, market_title)
++    fallback_note = None
++    if requested_market and resolved_market.lower() != requested_market.lower():
++        fallback_note = (
++            f"No data for {commodity_title} in {requested_market}; showing "
++            f"{resolved_market} instead."
++        )
+ 
+     cache_key = (commodity_title, resolved_market, horizon)
+     cached = _FORECAST_CACHE.get(cache_key)
+     if cached is not None:
+         cached_at, cached_response = cached
+         if time.monotonic() - cached_at < _FORECAST_CACHE_TTL_SECONDS:
+-            return cached_response
++            return _with_fallback_note(cached_response, fallback_note)
+         _FORECAST_CACHE.pop(cache_key, None)
+ 
+     train = _training_window(subset)
+@@ -1246,15 +1275,15 @@
+         horizon=horizon,
+     )
+     _FORECAST_CACHE[cache_key] = (time.monotonic(), response)
+-    return response
++    return _with_fallback_note(response, fallback_note)
+ 
+ 
+ @router.get("/compare/{commodity}", response_model=CompareResponse)
+ def compare_markets(
+     commodity: str,
+-    markets: str = Query(
+-        default="Kampala,Mbarara,Gulu",
+-        description="Comma-separated market names to compare (max 6)",
++    markets: Optional[str] = Query(
++        default=None,
++        description="Comma-separated market names to compare (max 6). Omit to compare the top markets with current data.",
+     ),
+     horizon: int = Query(
+         default=14,
+@@ -1270,18 +1299,21 @@
+     Markets with insufficient data are skipped and listed in `skipped_markets`.
+ 
+     **Example:**
+-    `/forecasts/compare/Maize?markets=Kampala,Mbarara,Kabale&horizon=14`
++    `/forecasts/compare/Maize?markets=Mbarara,Gulu,Arua&horizon=14`
+ 
+     Returns partial results if at least one market has enough data.
+     Use `GET /forecasts/commodities` to see which markets have data.
+     """
+     df = load_price_data()
+-    commodity_title = commodity.strip().title()
++    commodity_title = resolve_commodity(df, commodity)
+ 
+     # Parse and deduplicate market list (max 6 to keep response times sane)
+-    market_list = list(dict.fromkeys(
+-        m.strip().title() for m in markets.split(",") if m.strip()
+-    ))[:6]
++    if markets:
++        market_list = list(dict.fromkeys(
++            m.strip().title() for m in markets.split(",") if m.strip()
++        ))[:6]
++    else:
++        market_list = regular_markets(df, commodity_title, min_obs=4, limit=3)
+ 
+     results: list[ForecastResponse] = []
+     skipped: list[str] = []

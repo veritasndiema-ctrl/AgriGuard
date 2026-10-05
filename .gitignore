@@ -1,0 +1,65 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+.venv-*/
+venv/
+env/
+ENV/
+
+# ── ML models (large binaries — regenerate with scripts/train_models.py) ──────
+ml/models/*.pkl
+ml/models/*.joblib
+ml/models/metrics.json
+# keep the directory
+!ml/models/.gitkeep
+
+# ── Data (large CSVs — regenerate with scripts/download_wfp_data.py) ─────────
+data/raw/*.csv
+data/raw/*.json
+data/processed/
+# keep the directory
+!data/raw/.gitkeep
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+config/.env
+backend/.env
+*.env
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.idea/
+*.swp
+*.swo
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+.dockerignore
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.log
+*.sqlite
+agriguard_dev.db
+backend/.env
+*.patch
+*.db
+data/raw/.weather_sync_state.json
+.venv*/
+.pytest_cache/

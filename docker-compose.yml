@@ -1,0 +1,93 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AgriGuard docker-compose
+# ─────────────────────────────────────────────────────────────────────────────
+# Quick start:
+#   cp config/.env.example config/.env   # fill in your values
+#   docker-compose up --build
+#
+# To force fresh data + model training:
+#   docker-compose run --rm trainer
+#   docker-compose up backend frontend
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-common-env: &common-env
+  APP_ENV: ${APP_ENV:-development}
+  DEBUG: ${DEBUG:-false}
+  AGRIGUARD_PRICE_DATA: /app/data/raw/wfp_food_prices_uga.csv
+  MODEL_DIR: /app/ml/models
+
+services:
+
+  # ── one-shot: download data + train models ──────────────────────────────────
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: >
+      sh -c "
+        python scripts/download_wfp_data.py &&
+        python scripts/train_models.py
+      "
+    volumes:
+      - data_volume:/app/data
+      - model_volume:/app/ml/models
+    environment:
+      <<: *common-env
+    profiles:
+      - train   # run with: docker-compose --profile train run --rm trainer
+
+  # ── FastAPI backend ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: >
+      uvicorn backend.app.main:app
+        --host 0.0.0.0
+        --port 8000
+        --workers 2
+    ports:
+      - "8000:8000"
+    volumes:
+      - data_volume:/app/data:ro
+      - model_volume:/app/ml/models:ro
+    environment:
+      <<: *common-env
+      BACKEND_URL: http://backend:8000
+      FRONTEND_URL: http://frontend:8501
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/agriguard_dev.db}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── Streamlit frontend ──────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    command: >
+      streamlit run Home.py
+        --server.port 8501
+        --server.address 0.0.0.0
+        --server.headless true
+    ports:
+      - "8501:8501"
+    environment:
+      <<: *common-env
+      # Frontend reads this to reach the API — no more hardcoded localhost
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  data_volume:
+  model_volume:

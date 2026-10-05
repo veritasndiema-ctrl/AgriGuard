@@ -1,0 +1,17 @@
+--- ml/models/metrics.json	2026-10-05 10:17:26.531225359 +0000
++++ AgriGuard-main/ml/models/metrics.json	1970-01-01 00:00:00.000000000 +0000
+@@ -1,14 +0,0 @@
+-{
+-  "price_forecast": {
+-    "model": "XGBoostRegressor",
+-    "n_train": 19863,
+-    "n_test": 4678,
+-    "MAE_UGX": 544.43,
+-    "RMSE_UGX": 1648.62,
+-    "MAPE_pct": 12.78,
+-    "R2": 0.8992,
+-    "split": "chronological (latest 20% of months held out)",
+-    "naive_MAE_UGX": 554.31,
+-    "naive_MAPE_pct": 12.75
+-  }
+-}

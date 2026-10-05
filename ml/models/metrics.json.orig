@@ -1,0 +1,11 @@
+{
+  "price_forecast": {
+    "model": "XGBoostRegressor",
+    "n_train": 19632,
+    "n_test": 4909,
+    "MAE_UGX": 375.69,
+    "RMSE_UGX": 522.41,
+    "MAPE_pct": 19.99,
+    "R2": 0.9573
+  }
+}
